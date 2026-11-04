@@ -1,0 +1,758 @@
+diff --git a/app/src/main/java/com/twinndroid/CloneOperations.kt b/app/src/main/java/com/twinndroid/CloneOperations.kt
+index 6489874..572d664 100644
+--- a/app/src/main/java/com/twinndroid/CloneOperations.kt
++++ b/app/src/main/java/com/twinndroid/CloneOperations.kt
+@@ -48,8 +48,14 @@ object CloneOperations {
+ 
+         outputs.firstOrNull()?.parentFile?.deleteRecursively()
+         if (result.success) {
+-            CloneRepository.get(context).upsert(
+-                config.copy(builtVersionCode = source.versionCode, builtVersionName = source.versionName),
++            val repo = CloneRepository.get(context)
++            repo.upsert(
++                config.copy(
++                    builtVersionCode = source.versionCode,
++                    builtVersionName = source.versionName,
++                    // The clone may have been moved to another folder while it was building.
++                    folderId = repo.get(config.id)?.folderId ?: config.folderId,
++                ),
+             )
+         }
+         log(if (result.success) "✓ ${result.message}" else "✗ ${result.message}")
+diff --git a/app/src/main/java/com/twinndroid/data/BackupManager.kt b/app/src/main/java/com/twinndroid/data/BackupManager.kt
+index 150a56a..6ce958d 100644
+--- a/app/src/main/java/com/twinndroid/data/BackupManager.kt
++++ b/app/src/main/java/com/twinndroid/data/BackupManager.kt
+@@ -19,7 +19,7 @@ import java.util.zip.ZipOutputStream
+  */
+ object BackupManager {
+     private const val MARKER = "twinndroid-backup.txt"
+-    private val FILES = listOf("clones.json", "signing.p12")
++    private val FILES = listOf("clones.json", "folders.json", "signing.p12")
+     private val DIRS = listOf("sources", "icons")
+     private val PREFS = listOf("settings", "theme")
+ 
+@@ -80,6 +80,8 @@ object BackupManager {
+         require(valid) { "This is not a TwinnDroid backup file" }
+ 
+         for (name in FILES) File(staging, name).takeIf { it.isFile }?.copyTo(File(root, name), overwrite = true)
++        // Backups made before folders existed have no folders.json: don't keep stale folders around.
++        if (!File(staging, "folders.json").isFile) File(root, "folders.json").delete()
+         for (dir in DIRS) {
+             val src = File(staging, dir)
+             if (!src.isDirectory) continue
+diff --git a/app/src/main/java/com/twinndroid/data/CloneConfig.kt b/app/src/main/java/com/twinndroid/data/CloneConfig.kt
+index 74ff19f..ff00044 100644
+--- a/app/src/main/java/com/twinndroid/data/CloneConfig.kt
++++ b/app/src/main/java/com/twinndroid/data/CloneConfig.kt
+@@ -57,4 +57,6 @@ data class CloneConfig(
+     val builtVersionCode: Long = 0,
+     val builtVersionName: String? = null,
+     val createdAt: Long = System.currentTimeMillis(),
++    /** [CloneFolder.id] this clone is filed under, or null when it sits at the top level. */
++    val folderId: String? = null,
+ )
+diff --git a/app/src/main/java/com/twinndroid/data/CloneFolder.kt b/app/src/main/java/com/twinndroid/data/CloneFolder.kt
+new file mode 100644
+index 0000000..8c29739
+--- /dev/null
++++ b/app/src/main/java/com/twinndroid/data/CloneFolder.kt
+@@ -0,0 +1,13 @@
++package com.twinndroid.data
++
++import kotlinx.serialization.Serializable
++
++/** A user-made group of clones on the home screen. Clones point to it through [CloneConfig.folderId]. */
++@Serializable
++data class CloneFolder(
++    val id: String,
++    val name: String,
++    /** Whether the folder is shown folded on the home screen. Persisted so it survives restarts. */
++    val collapsed: Boolean = false,
++    val createdAt: Long = System.currentTimeMillis(),
++)
+diff --git a/app/src/main/java/com/twinndroid/data/CloneRepository.kt b/app/src/main/java/com/twinndroid/data/CloneRepository.kt
+index a02732c..3f80701 100644
+--- a/app/src/main/java/com/twinndroid/data/CloneRepository.kt
++++ b/app/src/main/java/com/twinndroid/data/CloneRepository.kt
+@@ -7,21 +7,32 @@ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.serialization.json.Json
+ import java.io.File
+ 
+-/** Clone definitions, persisted as a small JSON file in app-private storage. */
++/**
++ * Clone definitions and the folders that group them, persisted as small JSON files
++ * (clones.json, folders.json) in app-private storage.
++ */
+ class CloneRepository private constructor(context: Context) {
+ 
+     private val file = File(context.filesDir, "clones.json")
++    private val foldersFile = File(context.filesDir, "folders.json")
+     private val json = Json { ignoreUnknownKeys = true; prettyPrint = true; encodeDefaults = true }
+     private val _clones = MutableStateFlow(load())
+     val clones: StateFlow<List<CloneConfig>> = _clones.asStateFlow()
++    private val _folders = MutableStateFlow(loadFolders())
++    val folders: StateFlow<List<CloneFolder>> = _folders.asStateFlow()
+ 
+     private fun load(): List<CloneConfig> = runCatching {
+         if (file.exists()) json.decodeFromString<List<CloneConfig>>(file.readText()) else emptyList()
+     }.getOrDefault(emptyList())
+ 
+-    /** Re-reads clones.json from disk (after a backup restore). */
++    private fun loadFolders(): List<CloneFolder> = runCatching {
++        if (foldersFile.exists()) json.decodeFromString<List<CloneFolder>>(foldersFile.readText()) else emptyList()
++    }.getOrDefault(emptyList())
++
++    /** Re-reads clones.json and folders.json from disk (after a backup restore). */
+     @Synchronized
+     fun reload() {
++        _folders.value = loadFolders()
+         _clones.value = load()
+     }
+ 
+@@ -38,13 +49,51 @@ class CloneRepository private constructor(context: Context) {
+ 
+     fun get(id: String): CloneConfig? = _clones.value.firstOrNull { it.id == id }
+ 
++    // ---- folders -------------------------------------------------------------------------------
++
++    @Synchronized
++    fun upsertFolder(folder: CloneFolder) {
++        val list = _folders.value.toMutableList()
++        val i = list.indexOfFirst { it.id == folder.id }
++        if (i >= 0) list[i] = folder else list.add(folder)
++        persistFolders(list)
++    }
++
++    /** Deletes a folder only; the clones inside move back to the top level. */
++    @Synchronized
++    fun removeFolder(id: String) {
++        if (_clones.value.any { it.folderId == id }) {
++            persist(_clones.value.map { if (it.folderId == id) it.copy(folderId = null) else it })
++        }
++        persistFolders(_folders.value.filterNot { it.id == id })
++    }
++
++    /** Files a clone under [folderId], or back at the top level when it is null. */
++    @Synchronized
++    fun setFolder(cloneId: String, folderId: String?) {
++        val current = _clones.value.firstOrNull { it.id == cloneId } ?: return
++        if (current.folderId == folderId) return
++        upsert(current.copy(folderId = folderId))
++    }
++
++    // ---- persistence ---------------------------------------------------------------------------
++
+     private fun persist(list: List<CloneConfig>) {
+-        val tmp = File(file.parentFile, "clones.json.tmp")
+-        tmp.writeText(json.encodeToString(list))
+-        tmp.renameTo(file)
++        writeAtomically(file, json.encodeToString(list))
+         _clones.value = list
+     }
+ 
++    private fun persistFolders(list: List<CloneFolder>) {
++        writeAtomically(foldersFile, json.encodeToString(list))
++        _folders.value = list
++    }
++
++    private fun writeAtomically(target: File, text: String) {
++        val tmp = File(target.parentFile, target.name + ".tmp")
++        tmp.writeText(text)
++        tmp.renameTo(target)
++    }
++
+     companion object {
+         @Volatile private var instance: CloneRepository? = null
+         fun get(context: Context): CloneRepository =
+diff --git a/app/src/main/java/com/twinndroid/ui/HomeScreen.kt b/app/src/main/java/com/twinndroid/ui/HomeScreen.kt
+index ee931d8..655da49 100644
+--- a/app/src/main/java/com/twinndroid/ui/HomeScreen.kt
++++ b/app/src/main/java/com/twinndroid/ui/HomeScreen.kt
+@@ -10,6 +10,8 @@ import androidx.compose.animation.core.spring
+ import androidx.compose.foundation.Image
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.clickable
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+@@ -24,6 +26,7 @@ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.statusBarsPadding
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.LazyItemScope
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.shape.RoundedCornerShape
+@@ -31,8 +34,13 @@ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.automirrored.rounded.OpenInNew
+ import androidx.compose.material.icons.rounded.AdminPanelSettings
+ import androidx.compose.material.icons.rounded.Build
++import androidx.compose.material.icons.rounded.CreateNewFolder
+ import androidx.compose.material.icons.rounded.Delete
+ import androidx.compose.material.icons.rounded.Edit
++import androidx.compose.material.icons.rounded.ExpandLess
++import androidx.compose.material.icons.rounded.ExpandMore
++import androidx.compose.material.icons.rounded.Folder
++import androidx.compose.material.icons.rounded.FolderOpen
+ import androidx.compose.material.icons.rounded.MoreVert
+ import androidx.compose.material.icons.rounded.Palette
+ import androidx.compose.material.icons.rounded.Settings
+@@ -42,10 +50,12 @@ import androidx.compose.material3.AlertDialog
+ import androidx.compose.material3.DropdownMenu
+ import androidx.compose.material3.DropdownMenuItem
+ import androidx.compose.material3.FilledTonalButton
++import androidx.compose.material3.FilledTonalIconButton
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.IconButton
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.RadioButton
+ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
+ import androidx.compose.runtime.Composable
+@@ -63,22 +73,42 @@ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.IntOffset
+ import androidx.compose.ui.unit.dp
+ import com.twinndroid.R
++import com.twinndroid.data.CloneFolder
+ import com.twinndroid.install.ShizukuInstaller
+ import com.twinndroid.ui.theme.LocalTwinnExtras
+ 
+-/** First tab: the user's clones. */
++/** What the folder-name dialog is for: a new folder (optionally filing [moveItem] into it) or a rename. */
++private data class FolderNameRequest(val rename: CloneFolder? = null, val moveItem: CloneItem? = null)
++
++private fun LazyItemScope.motion(): Modifier = Modifier.animateItem(
++    fadeInSpec = spring(stiffness = Spring.StiffnessMediumLow),
++    placementSpec = spring(stiffness = Spring.StiffnessMediumLow, visibilityThreshold = IntOffset.VisibilityThreshold),
++)
++
++/** First tab: the user's clones, grouped into the user's folders. */
+ @Composable
+ fun ClonesPage(vm: MainViewModel, onNewClone: () -> Unit) {
+     val context = LocalContext.current
+     var confirmDelete by remember { mutableStateOf<CloneItem?>(null) }
+     var accessFor by remember { mutableStateOf<String?>(null) }
++    var moveFor by remember { mutableStateOf<String?>(null) }
++    var nameRequest by remember { mutableStateOf<FolderNameRequest?>(null) }
++    var confirmDeleteFolder by remember { mutableStateOf<CloneFolder?>(null) }
+     val canInstall = context.packageManager.canRequestPackageInstalls() ||
+         (vm.settings.useShizuku && ShizukuInstaller.hasPermission())
+ 
++    // A clone whose folder no longer exists is shown at the top level instead of disappearing.
++    val folderIds = vm.folders.map { it.id }.toSet()
++    val loose = vm.clones.filter { val fid = it.config.folderId; fid == null || fid !in folderIds }
++
++    val onDeleteClone: (CloneItem) -> Unit = { confirmDelete = it }
++    val onAccessClone: (CloneItem) -> Unit = { accessFor = it.config.id }
++    val onMoveClone: (CloneItem) -> Unit = { moveFor = it.config.id }
++
+     LazyColumn(
+         Modifier.fillMaxSize(),
+         contentPadding = PaddingValues(bottom = 24.dp),
+-        verticalArrangement = Arrangement.spacedBy(12.dp),
++        verticalArrangement = Arrangement.spacedBy(8.dp),
+     ) {
+         item(key = "header") {
+             HomeHeader(
+@@ -102,24 +132,45 @@ fun ClonesPage(vm: MainViewModel, onNewClone: () -> Unit) {
+             }
+         }
+ 
+-        if (vm.clones.isEmpty()) item(key = "empty") { EmptyState(onNewClone) }
++        if (vm.clones.isEmpty()) {
++            item(key = "empty") { EmptyState(onNewClone) }
++        } else {
++            item(key = "folders-bar") { FoldersBar(onNewFolder = { nameRequest = FolderNameRequest() }) }
++        }
+ 
+-        items(vm.clones, key = { it.config.id }) { item ->
+-            CloneCard(
+-                item = item,
+-                modifier = Modifier.animateItem(
+-                    fadeInSpec = spring(stiffness = Spring.StiffnessMediumLow),
+-                    placementSpec = spring(stiffness = Spring.StiffnessMediumLow, visibilityThreshold = IntOffset.VisibilityThreshold),
+-                ),
+-                onOpen = { vm.launchIntent(item.config.clonePackage)?.let(context::startActivity) },
+-                onBuild = { vm.rebuild(item.config) },
+-                onEdit = { vm.edit(item.config) },
+-                onUninstall = {
+-                    context.startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${item.config.clonePackage}")))
+-                },
+-                onDelete = { confirmDelete = item },
+-                onAccess = { accessFor = item.config.id },
+-            )
++        vm.folders.forEach { folder ->
++            val inside = vm.clones.filter { it.config.folderId == folder.id }
++            item(key = "folder-${folder.id}") {
++                FolderHeader(
++                    folder = folder,
++                    count = inside.size,
++                    updates = inside.count { it.updateAvailable },
++                    modifier = motion(),
++                    onToggle = { vm.toggleFolder(folder) },
++                    onRename = { nameRequest = FolderNameRequest(rename = folder) },
++                    onDelete = { confirmDeleteFolder = folder },
++                )
++            }
++            if (!folder.collapsed) {
++                if (inside.isEmpty()) {
++                    item(key = "folder-empty-${folder.id}") {
++                        Text(
++                            stringResource(R.string.folder_empty),
++                            style = MaterialTheme.typography.labelMedium,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant,
++                            modifier = motion().padding(start = 48.dp, end = 16.dp, bottom = 2.dp),
++                        )
++                    }
++                } else {
++                    items(inside, key = { it.config.id }) { item ->
++                        CloneEntry(vm, item, nested = true, modifier = motion(), onDeleteClone, onAccessClone, onMoveClone)
++                    }
++                }
++            }
++        }
++
++        items(loose, key = { it.config.id }) { item ->
++            CloneEntry(vm, item, nested = false, modifier = motion(), onDeleteClone, onAccessClone, onMoveClone)
+         }
+     }
+ 
+@@ -127,6 +178,42 @@ fun ClonesPage(vm: MainViewModel, onNewClone: () -> Unit) {
+         vm.clones.firstOrNull { it.config.id == id }?.let { item -> SpecialAccessSheet(vm, item) { accessFor = null } }
+     }
+ 
++    moveFor?.let { id ->
++        vm.clones.firstOrNull { it.config.id == id }?.let { item ->
++            MoveToFolderDialog(
++                item = item,
++                folders = vm.folders,
++                onDismiss = { moveFor = null },
++                onMove = { folderId -> vm.moveToFolder(item.config, folderId); moveFor = null },
++                onNewFolder = { nameRequest = FolderNameRequest(moveItem = item); moveFor = null },
++            )
++        }
++    }
++
++    nameRequest?.let { req ->
++        val renaming = req.rename
++        FolderNameDialog(
++            title = stringResource(if (renaming != null) R.string.rename_folder else R.string.new_folder),
++            initial = renaming?.name.orEmpty(),
++            confirmLabel = stringResource(if (renaming != null) R.string.folder_save else R.string.folder_create),
++            onDismiss = { nameRequest = null },
++            onConfirm = { name ->
++                if (renaming != null) vm.renameFolder(renaming, name) else vm.createFolder(name, req.moveItem?.config)
++                nameRequest = null
++            },
++        )
++    }
++
++    confirmDeleteFolder?.let { folder ->
++        AlertDialog(
++            onDismissRequest = { confirmDeleteFolder = null },
++            title = { Text(stringResource(R.string.delete_folder_title, folder.name)) },
++            text = { Text(stringResource(R.string.delete_folder_desc)) },
++            confirmButton = { TextButton(onClick = { vm.deleteFolder(folder); confirmDeleteFolder = null }) { Text(stringResource(R.string.folder_delete)) } },
++            dismissButton = { TextButton(onClick = { confirmDeleteFolder = null }) { Text(stringResource(R.string.cancel)) } },
++        )
++    }
++
+     confirmDelete?.let { item ->
+         AlertDialog(
+             onDismissRequest = { confirmDelete = null },
+@@ -183,9 +270,41 @@ fun WarningCard(title: String, body: String, action: String, modifier: Modifier
+     }
+ }
+ 
++@Composable
++private fun CloneEntry(
++    vm: MainViewModel,
++    item: CloneItem,
++    nested: Boolean,
++    modifier: Modifier,
++    onDeleteClone: (CloneItem) -> Unit,
++    onAccessClone: (CloneItem) -> Unit,
++    onMoveClone: (CloneItem) -> Unit,
++) {
++    val context = LocalContext.current
++    CloneCard(
++        item = item,
++        nested = nested,
++        modifier = modifier,
++        onOpen = { vm.launchIntent(item.config.clonePackage)?.let(context::startActivity) },
++        onBuild = { vm.rebuild(item.config) },
++        onEdit = { vm.edit(item.config) },
++        onUninstall = {
++            context.startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${item.config.clonePackage}")))
++        },
++        onDelete = { onDeleteClone(item) },
++        onAccess = { onAccessClone(item) },
++        onMove = { onMoveClone(item) },
++    )
++}
++
++/**
++ * One clone as a single slim row: icon, name + status, an inline Build/Update button only when one is
++ * needed, and a ⋮ menu holding every other action (Open, Edit, Rebuild, Move to folder, …).
++ */
+ @Composable
+ private fun CloneCard(
+     item: CloneItem,
++    nested: Boolean,
+     modifier: Modifier,
+     onOpen: () -> Unit,
+     onBuild: () -> Unit,
+@@ -193,76 +312,215 @@ private fun CloneCard(
+     onUninstall: () -> Unit,
+     onDelete: () -> Unit,
+     onAccess: () -> Unit,
++    onMove: () -> Unit,
+ ) {
+     val c = item.config
+     val ctx = LocalContext.current
+     var menu by remember { mutableStateOf(false) }
+-    TwinnCard(modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+-        Column(Modifier.padding(16.dp)) {
+-            Row(verticalAlignment = Alignment.CenterVertically) {
+-                if (item.icon != null) {
+-                    Image(item.icon, null, Modifier.size(52.dp))
+-                } else {
+-                    Box(Modifier.size(52.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant))
++    TwinnCard(
++        modifier.fillMaxWidth().padding(start = if (nested) 32.dp else 16.dp, end = 16.dp),
++        shape = RoundedCornerShape(18.dp),
++    ) {
++        Row(
++            Modifier.padding(start = 12.dp, top = 6.dp, bottom = 6.dp, end = 4.dp),
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            if (item.icon != null) {
++                Image(item.icon, null, Modifier.size(40.dp))
++            } else {
++                Box(Modifier.size(40.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant))
++            }
++            Spacer(Modifier.width(12.dp))
++            Column(Modifier.weight(1f)) {
++                Text(c.label, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                StatusChip(item)
++                if (item.missingAccess.isNotEmpty()) {
++                    Text(
++                        stringResource(R.string.needs_access, item.missingAccess.joinToString { ctx.getString(it.label).lowercase() }),
++                        style = MaterialTheme.typography.labelMedium,
++                        color = MaterialTheme.colorScheme.tertiary,
++                        modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable(onClick = onAccess).padding(vertical = 2.dp),
++                    )
++                }
++            }
++            if (item.updateAvailable || item.installedVersion == null) {
++                FilledTonalIconButton(onClick = onBuild) {
++                    Icon(
++                        if (item.updateAvailable) Icons.Rounded.SystemUpdate else Icons.Rounded.Build,
++                        stringResource(if (item.updateAvailable) R.string.update else R.string.build_install),
++                        Modifier.size(20.dp),
++                    )
+                 }
+-                Spacer(Modifier.width(14.dp))
+-                Column(Modifier.weight(1f)) {
+-                    Text(c.label, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
++            }
++            Box {
++                IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, stringResource(R.string.more)) }
++                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
++                    if (item.installedVersion != null) {
++                        DropdownMenuItem(text = { Text(stringResource(R.string.open)) }, leadingIcon = { Icon(Icons.AutoMirrored.Rounded.OpenInNew, null) }, onClick = { menu = false; onOpen() })
++                    }
++                    DropdownMenuItem(text = { Text(stringResource(R.string.edit)) }, leadingIcon = { Icon(Icons.Rounded.Edit, null) }, onClick = { menu = false; onEdit() })
++                    DropdownMenuItem(text = { Text(stringResource(R.string.rebuild)) }, leadingIcon = { Icon(Icons.Rounded.Build, null) }, onClick = { menu = false; onBuild() })
++                    if (item.access.isNotEmpty()) {
++                        DropdownMenuItem(text = { Text(stringResource(R.string.special_access)) }, leadingIcon = { Icon(Icons.Rounded.AdminPanelSettings, null) }, onClick = { menu = false; onAccess() })
++                    }
++                    DropdownMenuItem(text = { Text(stringResource(R.string.move_to_folder)) }, leadingIcon = { Icon(Icons.Rounded.Folder, null) }, onClick = { menu = false; onMove() })
++                    if (item.installedVersion != null) {
++                        DropdownMenuItem(text = { Text(stringResource(R.string.uninstall_clone)) }, leadingIcon = { Icon(Icons.Rounded.Delete, null) }, onClick = { menu = false; onUninstall() })
++                    }
++                    DropdownMenuItem(text = { Text(stringResource(R.string.remove_from_list)) }, onClick = { menu = false; onDelete() })
++                }
++            }
++        }
++    }
++}
++
++/** Slim row above the list with the "New folder" action. */
++@Composable
++private fun FoldersBar(onNewFolder: () -> Unit, modifier: Modifier = Modifier) {
++    Row(modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.End) {
++        TextButton(
++            onClick = onNewFolder,
++            modifier = Modifier.height(32.dp),
++            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
++        ) {
++            Icon(Icons.Rounded.CreateNewFolder, null, Modifier.size(18.dp))
++            Spacer(Modifier.width(6.dp))
++            Text(stringResource(R.string.new_folder))
++        }
++    }
++}
++
++/** Tappable folder row: tap to fold/unfold, ⋮ for rename and delete. */
++@Composable
++private fun FolderHeader(
++    folder: CloneFolder,
++    count: Int,
++    updates: Int,
++    modifier: Modifier,
++    onToggle: () -> Unit,
++    onRename: () -> Unit,
++    onDelete: () -> Unit,
++) {
++    val res = LocalContext.current.resources
++    var menu by remember { mutableStateOf(false) }
++    TwinnCard(
++        modifier.fillMaxWidth().padding(horizontal = 16.dp),
++        shape = RoundedCornerShape(18.dp),
++    ) {
++        Row(
++            Modifier.clickable(onClick = onToggle).padding(start = 12.dp, top = 2.dp, bottom = 2.dp, end = 4.dp),
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Icon(
++                if (folder.collapsed) Icons.Rounded.Folder else Icons.Rounded.FolderOpen,
++                null,
++                Modifier.size(28.dp),
++                tint = MaterialTheme.colorScheme.primary,
++            )
++            Spacer(Modifier.width(12.dp))
++            Column(Modifier.weight(1f)) {
++                Text(folder.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                Row(verticalAlignment = Alignment.CenterVertically) {
+                     Text(
+-                        c.clonePackage,
+-                        style = MaterialTheme.typography.bodySmall,
++                        res.getQuantityString(R.plurals.clone_count, count, count),
++                        style = MaterialTheme.typography.labelMedium,
+                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+-                        maxLines = 1,
+-                        overflow = TextOverflow.Ellipsis,
+                     )
+-                    Spacer(Modifier.height(6.dp))
+-                    StatusChip(item)
+-                    if (item.missingAccess.isNotEmpty()) {
+-                        Spacer(Modifier.height(6.dp))
++                    if (updates > 0) {
++                        Spacer(Modifier.width(8.dp))
++                        Box(Modifier.size(8.dp).clip(CircleShape).background(MaterialTheme.colorScheme.tertiary))
++                        Spacer(Modifier.width(4.dp))
+                         Text(
+-                            stringResource(R.string.needs_access, item.missingAccess.joinToString { ctx.getString(it.label).lowercase() }),
++                            res.getQuantityString(R.plurals.update_count, updates, updates),
+                             style = MaterialTheme.typography.labelMedium,
+                             color = MaterialTheme.colorScheme.tertiary,
+-                            modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable(onClick = onAccess).padding(vertical = 2.dp),
+                         )
+                     }
+                 }
+-                Box {
+-                    IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, stringResource(R.string.more)) }
+-                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+-                        DropdownMenuItem(text = { Text(stringResource(R.string.edit)) }, leadingIcon = { Icon(Icons.Rounded.Edit, null) }, onClick = { menu = false; onEdit() })
+-                        DropdownMenuItem(text = { Text(stringResource(R.string.rebuild)) }, leadingIcon = { Icon(Icons.Rounded.Build, null) }, onClick = { menu = false; onBuild() })
+-                        if (item.installedVersion != null) {
+-                            DropdownMenuItem(text = { Text(stringResource(R.string.uninstall_clone)) }, leadingIcon = { Icon(Icons.Rounded.Delete, null) }, onClick = { menu = false; onUninstall() })
+-                        }
+-                        if (item.access.isNotEmpty()) {
+-                            DropdownMenuItem(text = { Text(stringResource(R.string.special_access)) }, leadingIcon = { Icon(Icons.Rounded.AdminPanelSettings, null) }, onClick = { menu = false; onAccess() })
+-                        }
+-                        DropdownMenuItem(text = { Text(stringResource(R.string.remove_from_list)) }, onClick = { menu = false; onDelete() })
+-                    }
+-                }
+             }
+-            Spacer(Modifier.height(12.dp))
+-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+-                when {
+-                    item.updateAvailable -> FilledTonalButton(onClick = onBuild) {
+-                        Icon(Icons.Rounded.SystemUpdate, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(stringResource(R.string.update))
+-                    }
+-                    item.installedVersion == null -> FilledTonalButton(onClick = onBuild) {
+-                        Icon(Icons.Rounded.Build, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(stringResource(R.string.build_install))
+-                    }
+-                }
+-                if (item.installedVersion != null) {
+-                    OutlinedButton(onClick = onOpen) {
+-                        Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(stringResource(R.string.open))
+-                    }
++            Icon(
++                if (folder.collapsed) Icons.Rounded.ExpandMore else Icons.Rounded.ExpandLess,
++                null,
++                tint = MaterialTheme.colorScheme.onSurfaceVariant,
++            )
++            Box {
++                IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, stringResource(R.string.more)) }
++                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
++                    DropdownMenuItem(text = { Text(stringResource(R.string.rename_folder)) }, leadingIcon = { Icon(Icons.Rounded.Edit, null) }, onClick = { menu = false; onRename() })
++                    DropdownMenuItem(text = { Text(stringResource(R.string.delete_folder)) }, leadingIcon = { Icon(Icons.Rounded.Delete, null) }, onClick = { menu = false; onDelete() })
+                 }
+-                OutlinedButton(onClick = onEdit) { Text(stringResource(R.string.customize)) }
+             }
+         }
+     }
+ }
+ 
++@Composable
++private fun FolderNameDialog(
++    title: String,
++    initial: String,
++    confirmLabel: String,
++    onDismiss: () -> Unit,
++    onConfirm: (String) -> Unit,
++) {
++    var name by remember { mutableStateOf(initial) }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(title) },
++        text = {
++            OutlinedTextField(
++                value = name,
++                onValueChange = { name = it.take(40) },
++                singleLine = true,
++                label = { Text(stringResource(R.string.folder_name)) },
++            )
++        },
++        confirmButton = { TextButton(enabled = name.isNotBlank(), onClick = { onConfirm(name) }) { Text(confirmLabel) } },
++        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) } },
++    )
++}
++
++/** Pick the folder a clone lives in ("No folder" = top level), or make a new one for it. */
++@Composable
++private fun MoveToFolderDialog(
++    item: CloneItem,
++    folders: List<CloneFolder>,
++    onDismiss: () -> Unit,
++    onMove: (String?) -> Unit,
++    onNewFolder: () -> Unit,
++) {
++    val current = item.config.folderId?.takeIf { id -> folders.any { it.id == id } }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(stringResource(R.string.move_to_folder)) },
++        text = {
++            Column(Modifier.verticalScroll(rememberScrollState())) {
++                FolderChoice(stringResource(R.string.no_folder), selected = current == null) { onMove(null) }
++                folders.forEach { f -> FolderChoice(f.name, selected = current == f.id) { onMove(f.id) } }
++            }
++        },
++        confirmButton = {
++            TextButton(onClick = onNewFolder) {
++                Icon(Icons.Rounded.CreateNewFolder, null, Modifier.size(18.dp))
++                Spacer(Modifier.width(6.dp))
++                Text(stringResource(R.string.new_folder))
++            }
++        },
++        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) } },
++    )
++}
++
++@Composable
++private fun FolderChoice(label: String, selected: Boolean, onClick: () -> Unit) {
++    Row(
++        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable(onClick = onClick).padding(vertical = 6.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        RadioButton(selected = selected, onClick = null)
++        Spacer(Modifier.width(12.dp))
++        Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis)
++    }
++}
++
+ @Composable
+ private fun StatusChip(item: CloneItem) {
+     val (text, color) = when {
+diff --git a/app/src/main/java/com/twinndroid/ui/MainViewModel.kt b/app/src/main/java/com/twinndroid/ui/MainViewModel.kt
+index 442f9aa..d16d749 100644
+--- a/app/src/main/java/com/twinndroid/ui/MainViewModel.kt
++++ b/app/src/main/java/com/twinndroid/ui/MainViewModel.kt
+@@ -19,6 +19,7 @@ import com.twinndroid.BuildConfig
+ import com.twinndroid.R
+ import com.twinndroid.data.AppUpdate
+ import com.twinndroid.data.CloneConfig
++import com.twinndroid.data.CloneFolder
+ import com.twinndroid.data.UpdateChecker
+ import com.twinndroid.data.CloneRepository
+ import com.twinndroid.data.IconMode
+@@ -96,6 +97,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
+     var screen by mutableStateOf(Screen.Home)
+     var clones by mutableStateOf<List<CloneItem>>(emptyList())
+         private set
++    /** Folders on the home screen, oldest first. Clones link to them through [CloneConfig.folderId]. */
++    var folders by mutableStateOf<List<CloneFolder>>(emptyList())
++        private set
+     var apps by mutableStateOf<List<AppEntry>?>(null)
+         private set
+     var editor by mutableStateOf<EditorState?>(null)
+@@ -117,6 +121,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
+     init {
+         if (settings.checkUpdates) checkForAppUpdate()
+         viewModelScope.launch { repo.clones.collect { refreshClones() } }
++        viewModelScope.launch { repo.folders.collect { list -> folders = list.sortedBy { it.createdAt } } }
+     }
+ 
+     fun refreshClones() = viewModelScope.launch {
+@@ -333,6 +338,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
+ 
+     fun launchIntent(packageName: String): Intent? = ctx.packageManager.getLaunchIntentForPackage(packageName)
+ 
++    // ---- folders --------------------------------------------------------------------------------
++
++    /** Makes a folder, and files [thenMove] into it straight away when given. */
++    fun createFolder(name: String, thenMove: CloneConfig? = null) {
++        val clean = name.trim()
++        if (clean.isEmpty()) return
++        val folder = CloneFolder(id = UUID.randomUUID().toString(), name = clean)
++        repo.upsertFolder(folder)
++        thenMove?.let { repo.setFolder(it.id, folder.id) }
++    }
++
++    fun renameFolder(folder: CloneFolder, name: String) {
++        val clean = name.trim()
++        if (clean.isNotEmpty()) repo.upsertFolder(folder.copy(name = clean))
++    }
++
++    fun toggleFolder(folder: CloneFolder) = repo.upsertFolder(folder.copy(collapsed = !folder.collapsed))
++
++    /** Deletes the folder only; its clones go back to the top level. */
++    fun deleteFolder(folder: CloneFolder) = repo.removeFolder(folder.id)
++
++    /** Files a clone under [folderId], or at the top level when it is null. */
++    fun moveToFolder(config: CloneConfig, folderId: String?) = repo.setFolder(config.id, folderId)
++
+     // ---- extract ------------------------------------------------------------------------------
+ 
+     fun openExport(packageName: String) = launchBusy {
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 1a3829d..8ba8172 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -93,6 +93,18 @@
+     <string name="remove_from_list">Remove from list</string>
+     <string name="build_install">Build &amp; install</string>
+     <string name="customize">Customize</string>
++    <string name="new_folder">New folder</string>
++    <string name="folder_name">Folder name</string>
++    <string name="rename_folder">Rename folder</string>
++    <string name="move_to_folder">Move to folder</string>
++    <string name="no_folder">No folder</string>
++    <string name="delete_folder">Delete folder</string>
++    <string name="delete_folder_title">Delete “%1$s”?</string>
++    <string name="delete_folder_desc">The clones inside stay in your list, they just leave the folder.</string>
++    <string name="folder_empty">Empty folder</string>
++    <string name="folder_create">Create</string>
++    <string name="folder_save">Save</string>
++    <string name="folder_delete">Delete</string>
+     <string name="status_update">Update available</string>
+     <string name="status_installed">Installed · %1$s</string>
+     <string name="status_not_installed">Not installed</string>
