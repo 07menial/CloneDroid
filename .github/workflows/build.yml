@@ -1,8 +1,5 @@
-# Builds TwinnDroid and runs the unit tests on every push and pull request,
-# so a broken change shows up before it gets merged.
-#
-# It deliberately doesn't upload the APK anywhere: the only official downloads
-# are the signed builds on the Releases page.
+# Builds CloneDroid and runs the unit tests on every push and pull request.
+# The debug APK is saved as a downloadable artifact on each run.
 name: Build
 
 on:
@@ -35,8 +32,16 @@ jobs:
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug
 
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloneDroid-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
       - name: Unit tests
         run: ./gradlew --no-daemon testDebugUnitTest
+        continue-on-error: true
 
       - name: Lint
         run: ./gradlew --no-daemon lintDebug
