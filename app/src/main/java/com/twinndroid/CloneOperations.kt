@@ -48,8 +48,14 @@ object CloneOperations {
 
         outputs.firstOrNull()?.parentFile?.deleteRecursively()
         if (result.success) {
-            CloneRepository.get(context).upsert(
-                config.copy(builtVersionCode = source.versionCode, builtVersionName = source.versionName),
+            val repo = CloneRepository.get(context)
+            repo.upsert(
+                config.copy(
+                    builtVersionCode = source.versionCode,
+                    builtVersionName = source.versionName,
+                    // The clone may have been moved to another folder while it was building.
+                    folderId = repo.get(config.id)?.folderId ?: config.folderId,
+                ),
             )
         }
         log(if (result.success) "✓ ${result.message}" else "✗ ${result.message}")
