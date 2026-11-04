@@ -19,6 +19,7 @@ import com.twinndroid.BuildConfig
 import com.twinndroid.R
 import com.twinndroid.data.AppUpdate
 import com.twinndroid.data.CloneConfig
+import com.twinndroid.data.CloneFolder
 import com.twinndroid.data.UpdateChecker
 import com.twinndroid.data.CloneRepository
 import com.twinndroid.data.IconMode
@@ -96,6 +97,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var screen by mutableStateOf(Screen.Home)
     var clones by mutableStateOf<List<CloneItem>>(emptyList())
         private set
+    /** Folders on the home screen, oldest first. Clones link to them through [CloneConfig.folderId]. */
+    var folders by mutableStateOf<List<CloneFolder>>(emptyList())
+        private set
     var apps by mutableStateOf<List<AppEntry>?>(null)
         private set
     var editor by mutableStateOf<EditorState?>(null)
@@ -117,6 +121,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     init {
         if (settings.checkUpdates) checkForAppUpdate()
         viewModelScope.launch { repo.clones.collect { refreshClones() } }
+        viewModelScope.launch { repo.folders.collect { list -> folders = list.sortedBy { it.createdAt } } }
     }
 
     fun refreshClones() = viewModelScope.launch {
@@ -332,6 +337,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun launchIntent(packageName: String): Intent? = ctx.packageManager.getLaunchIntentForPackage(packageName)
+
+    // ---- folders --------------------------------------------------------------------------------
+
+    /** Makes a folder, and files [thenMove] into it straight away when given. */
+    fun createFolder(name: String, thenMove: CloneConfig? = null) {
+        val clean = name.trim()
+        if (clean.isEmpty()) return
+        val folder = CloneFolder(id = UUID.randomUUID().toString(), name = clean)
+        repo.upsertFolder(folder)
+        thenMove?.let { repo.setFolder(it.id, folder.id) }
+    }
+
+    fun renameFolder(folder: CloneFolder, name: String) {
+        val clean = name.trim()
+        if (clean.isNotEmpty()) repo.upsertFolder(folder.copy(name = clean))
+    }
+
+    fun toggleFolder(folder: CloneFolder) = repo.upsertFolder(folder.copy(collapsed = !folder.collapsed))
+
+    /** Deletes the folder only; its clones go back to the top level. */
+    fun deleteFolder(folder: CloneFolder) = repo.removeFolder(folder.id)
+
+    /** Files a clone under [folderId], or at the top level when it is null. */
+    fun moveToFolder(config: CloneConfig, folderId: String?) = repo.setFolder(config.id, folderId)
 
     // ---- extract ------------------------------------------------------------------------------
 
