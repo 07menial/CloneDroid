@@ -57,4 +57,6 @@ data class CloneConfig(
     val builtVersionCode: Long = 0,
     val builtVersionName: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
+    /** [CloneFolder.id] this clone is filed under, or null when it sits at the top level. */
+    val folderId: String? = null,
 )
