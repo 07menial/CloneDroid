@@ -19,7 +19,7 @@ import java.util.zip.ZipOutputStream
  */
 object BackupManager {
     private const val MARKER = "twinndroid-backup.txt"
-    private val FILES = listOf("clones.json", "signing.p12")
+    private val FILES = listOf("clones.json", "folders.json", "signing.p12")
     private val DIRS = listOf("sources", "icons")
     private val PREFS = listOf("settings", "theme")
 
@@ -80,6 +80,8 @@ object BackupManager {
         require(valid) { "This is not a TwinnDroid backup file" }
 
         for (name in FILES) File(staging, name).takeIf { it.isFile }?.copyTo(File(root, name), overwrite = true)
+        // Backups made before folders existed have no folders.json: don't keep stale folders around.
+        if (!File(staging, "folders.json").isFile) File(root, "folders.json").delete()
         for (dir in DIRS) {
             val src = File(staging, dir)
             if (!src.isDirectory) continue
